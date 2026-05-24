@@ -238,6 +238,28 @@ body {
   50%      { box-shadow: 0 0 0 7px rgba(255, 80, 80, 0.10); }
 }
 
+/* ---------- mic status label ---------- */
+
+#mic-status {
+  position: absolute;
+  top: 28px;
+  right: 28px;
+  font-size: 10px;
+  color: #f5c842;
+  background: rgba(0, 0, 0, 0.45);
+  padding: 2px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+  z-index: 11;
+}
+
+#mic-status.mic-status-visible {
+  opacity: 1;
+}
+
 /* ---------- speech bubble (autonomous) ---------- */
 
 #bubble {

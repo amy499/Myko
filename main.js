@@ -14,6 +14,9 @@ const { execFile } = require("child_process");
 const { promisify } = require("util");
 
 const brain = require("./brain");
+const { CalendarManager, GoogleCalendarProvider, OutlookCalendarProvider } = require("./calendar");
+const { speakWithQwen3, isQwen3Available } = require("./voice");
+const listenerModule = require("./listener");
 
 const execFileP = promisify(execFile);
 
@@ -52,9 +55,43 @@ function createWindow() {
   mainWindow.loadFile("index.html");
 }
 
-app.whenReady().then(() => {
+/* ---------- calendar provider instances (may be null if keys absent) ---------- */
+let calendar = null;
+let googleProvider = null;
+let outlookProvider = null;
+
+app.whenReady().then(async () => {
   createWindow();
   startMouseDwellWatcher();
+
+  // Initialize CalendarManager and register whichever providers have keys.
+  calendar = new CalendarManager();
+
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    googleProvider = new GoogleCalendarProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      redirectUri: process.env.GOOGLE_REDIRECT_URI || "urn:ietf:wg:oauth:2.0:oob",
+    });
+    calendar.register(googleProvider);
+    console.log("[calendar] Google Calendar provider registered");
+  } else {
+    console.log("[calendar] GOOGLE_CLIENT_ID/SECRET not set — Google Calendar skipped");
+  }
+
+  if (process.env.OUTLOOK_CLIENT_ID) {
+    outlookProvider = new OutlookCalendarProvider({
+      clientId: process.env.OUTLOOK_CLIENT_ID,
+      tenantId: process.env.OUTLOOK_TENANT_ID || "common",
+    });
+    calendar.register(outlookProvider);
+    console.log("[calendar] Outlook Calendar provider registered");
+  } else {
+    console.log("[calendar] OUTLOOK_CLIENT_ID not set — Outlook Calendar skipped");
+  }
+
+  // Give listener.js access to the calendar instance for intent handling.
+  listenerModule.setCalendar(calendar);
 });
 
 app.on("window-all-closed", () => {
@@ -203,9 +240,16 @@ ipcMain.handle("describe-screen", async (_e, imageBuffer) => {
   return brain.describeScreen(buf);
 });
 
-ipcMain.handle("get-cat-response", async (_e, description, memory) =>
-  brain.getCatResponse(description, memory)
-);
+ipcMain.handle("get-cat-response", async (_e, description, memory) => {
+  let enrichedDescription = description;
+  if (calendar) {
+    const calendarContext = await calendar.getContextSummary(24);
+    if (calendarContext) {
+      enrichedDescription = `${description}\n\nUpcoming events:\n${calendarContext}`;
+    }
+  }
+  return brain.getCatResponse(enrichedDescription, memory);
+});
 
 ipcMain.handle("read-memory", async () => {
   try {
@@ -451,6 +495,89 @@ ipcMain.handle("cat:proactiveAssist", async () => {
     fs.unlink(tmp).catch(() => {});
   }
 });
+
+/* ---------- calendar IPC handlers ---------- */
+
+ipcMain.handle("calendar:readUpcoming", async () => {
+  if (!calendar) return [];
+  return calendar.readAllUpcoming(7);
+});
+
+ipcMain.handle("calendar:writeEvent", async (_e, providerName, eventData) => {
+  if (!calendar) return null;
+  return calendar.writeEvent(providerName, eventData);
+});
+
+ipcMain.handle("calendar:getConnected", async () => {
+  if (!calendar) return [];
+  return calendar.getConnectedProviders().map((p) => p.name);
+});
+
+ipcMain.handle("calendar:connectGoogle", async () => {
+  if (!googleProvider) return null;
+  return googleProvider.getAuthUrl();
+});
+
+ipcMain.handle("calendar:handleGoogleCode", async (_e, code) => {
+  if (!googleProvider) return null;
+  return googleProvider.handleAuthCode(code);
+});
+
+ipcMain.handle("calendar:connectOutlook", async () => {
+  if (!outlookProvider) return null;
+  await outlookProvider.connect((message, code, url) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("calendar:outlookDeviceCode", { message, code, url });
+    }
+  });
+});
+
+/* ---------- voice:speak (Qwen3 with ElevenLabs fallback) ---------- */
+
+ipcMain.handle("voice:speak", async (_e, text) => {
+  if (!text || !text.trim()) return { ok: false, reason: "empty-text" };
+  if (isQwen3Available()) {
+    try {
+      await speakWithQwen3(text);
+      return { ok: true, engine: "qwen3" };
+    } catch (e) {
+      console.error("[voice] Qwen3 speak failed:", e.message);
+    }
+  }
+  // Fall back to the existing ElevenLabs handler logic.
+  if (!process.env.ELEVENLABS_API_KEY) {
+    return { ok: false, reason: "no-api-key" };
+  }
+  const settings = await readSettings();
+  const profile = settings.voiceProfile || "soft";
+  const voiceId = brain.VOICE_LIBRARY[profile] || brain.VOICE_LIBRARY.soft;
+  try {
+    const res = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": process.env.ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+          Accept: "audio/mpeg",
+        },
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_flash_v2_5",
+          voice_settings: { stability: 0.55, similarity_boost: 0.75 },
+        }),
+      }
+    );
+    if (!res.ok) return { ok: false, reason: "api-error", status: res.status };
+    const buf = Buffer.from(await res.arrayBuffer());
+    return { ok: true, audio: buf.toString("base64"), engine: "elevenlabs" };
+  } catch (e) {
+    console.error("[voice] ElevenLabs fallback failed:", e.message);
+    return { ok: false, reason: "network-error" };
+  }
+});
+
+/* ---------- settings file bootstrap ---------- */
 
 if (!fsSync.existsSync(SETTINGS_PATH)) {
   fsSync.writeFileSync(

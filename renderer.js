@@ -18,6 +18,7 @@ const $catWrapper = document.getElementById("cat-wrapper");
 const $catStack = document.getElementById("cat-stack");
 const $settingsBtn = document.getElementById("settings-btn");
 const $micBtn = document.getElementById("mic-btn");
+const $micStatus = document.getElementById("mic-status");
 
 const $settingsOverlay = document.getElementById("settings-overlay");
 const $settingsClose = document.getElementById("settings-close");
@@ -827,6 +828,7 @@ function startListeningUI() {
   listening = true;
   $micBtn.classList.add("listening");
   $micBtn.textContent = "●";
+  if ($micStatus) { $micStatus.textContent = "Listening..."; $micStatus.classList.add("mic-status-visible"); }
   pokeAwake();
   perk();
 }
@@ -835,6 +837,7 @@ function stopListeningUI() {
   listening = false;
   $micBtn.classList.remove("listening");
   $micBtn.textContent = "🎙";
+  if ($micStatus) { $micStatus.textContent = "Thinking..."; }
 }
 
 async function startRecording() {
@@ -863,21 +866,37 @@ async function startRecording() {
       mediaStream.getTracks().forEach((t) => t.stop());
       mediaStream = null;
     }
-    stopListeningUI();
-    if (blob.size < 800) return; // probably silence/no speech
+    stopListeningUI(); // sets $micStatus to "Thinking..."
+    if (blob.size < 800) {
+      // Probably silence — hide status and bail.
+      if ($micStatus) $micStatus.classList.remove("mic-status-visible");
+      return;
+    }
     try {
-      const buf = new Uint8Array(await blob.arrayBuffer());
-      const res = await cat.transcribe(buf, recordedMimeType);
-      if (res?.ok && res.text) {
-        handleUserSpeech(res.text);
-      } else {
-        console.warn("[cat] transcribe failed:", res?.reason, res?.detail || "");
-        if (res?.reason === "no-api-key") {
-          showBubble("I need an OPENAI_API_KEY to hear you.", 3500);
+      // Convert Blob → base64 via FileReader, then route through listener:stop
+      // so listener.js can handle calendar intents and general cat replies together.
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          // data:audio/webm;base64,<BASE64> → extract after the comma
+          const base64 = reader.result.split(",")[1];
+          cat.listenerStart();
+          await cat.listenerStop(base64);
+          // Response arrives via the "listener:result" event handler below.
+        } catch (e) {
+          console.warn("[listener] listenerStop failed:", e?.message || e);
+          if ($micStatus) $micStatus.classList.remove("mic-status-visible");
+          showBubble("Sorry, I didn't catch that.", 2500);
         }
-      }
+      };
+      reader.onerror = () => {
+        console.warn("[listener] FileReader error");
+        if ($micStatus) $micStatus.classList.remove("mic-status-visible");
+      };
+      reader.readAsDataURL(blob);
     } catch (e) {
-      console.warn("[cat] transcribe exception:", e?.message || e);
+      console.warn("[listener] onstop exception:", e?.message || e);
+      if ($micStatus) $micStatus.classList.remove("mic-status-visible");
     }
   };
 
@@ -928,6 +947,38 @@ $micBtn.addEventListener("click", (e) => {
 
 // Stop the wrapper drag handler from picking up mic clicks.
 $micBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+
+/* ---------- listener result / error handlers ---------- */
+
+if (cat.onListenerResult) {
+  cat.onListenerResult((data) => {
+    console.log("[listener] result:", data);
+    if ($micStatus) $micStatus.classList.remove("mic-status-visible");
+    if (data && data.response && data.response.trim()) {
+      speakAndShow(data.response, { mode: "curious", allowRepeat: true });
+    }
+  });
+}
+
+if (cat.onListenerError) {
+  cat.onListenerError((data) => {
+    console.warn("[listener] error:", data?.message || data);
+    if ($micStatus) $micStatus.classList.remove("mic-status-visible");
+    $micBtn.classList.remove("listening");
+    showBubble("Sorry, I didn't catch that.", 2500);
+  });
+}
+
+/* ---------- keyboard shortcut: M toggles mic ---------- */
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === "m" || e.key === "M") {
+    // Only fire when no text input is focused.
+    if (document.activeElement && document.activeElement.tagName === "INPUT") return;
+    if (listening) stopRecording();
+    else startRecording();
+  }
+});
 
 /* ---------- mouse-question handler (from main process) ---------- */
 function handleMouseQuestion(question) {

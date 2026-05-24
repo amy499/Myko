@@ -29,4 +29,12 @@ contextBridge.exposeInMainWorld("desktopCat", {
 
   onMouseQuestion: (cb) =>
     ipcRenderer.on("cat:mouseQuestion", (_e, q) => cb(q)),
+
+  // Voice listener pipeline (listener.js / Task 4)
+  listenerStart: () => ipcRenderer.send("listener:start"),
+  listenerStop: (base64) => ipcRenderer.invoke("listener:stop", base64),
+  onListenerResult: (cb) =>
+    ipcRenderer.on("listener:result", (_e, data) => cb(data)),
+  onListenerError: (cb) =>
+    ipcRenderer.on("listener:error", (_e, data) => cb(data)),
 });

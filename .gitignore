@@ -222,4 +222,5 @@ node_modules/
 memory.json
 journal.txt
 settings.json
+calendar_tokens.json
 .DS_Store
