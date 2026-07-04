@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld("desktopCat", {
 
   speak: (payload) => ipcRenderer.invoke("cat:speak", payload),
   hasVoiceKey: () => ipcRenderer.invoke("cat:hasVoiceKey"),
+  hasOllama: () => ipcRenderer.invoke("cat:hasOllama"),
   hasTranscriptionKey: () => ipcRenderer.invoke("cat:hasTranscriptionKey"),
   replyToUser: (text) => ipcRenderer.invoke("cat:replyToUser", text),
   transcribe: (audio, mimeType) =>

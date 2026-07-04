@@ -579,6 +579,16 @@ body {
   color: #ffb380;
 }
 
+#offline-status {
+  margin-top: 8px;
+  font-size: 11px;
+  color: rgba(244, 240, 232, 0.5);
+}
+
+#offline-status.warn {
+  color: #ffb380;
+}
+
 /* ---------- utilities ---------- */
 
 .hidden {

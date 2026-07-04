@@ -1,5 +1,6 @@
 const fs = require("fs/promises");
 const path = require("path");
+const { chatWithOllama, isOllamaConfigured } = require("./ollama");
 
 const TEXT_MODEL = process.env.OPENAI_TEXT_MODEL || "gpt-4o-mini";
 const VISION_MODEL = process.env.OPENAI_VISION_MODEL || "gpt-4o-mini";
@@ -21,10 +22,20 @@ function noteGeminiRateLimit(detail) {
   console.warn("[brain] Gemini rate-limit — backing off 60 min", detail || "");
 }
 // Back-compat sentinel for older code paths: only "blocked" if BOTH are out.
+// Used by the vision-only functions (Ollama has no vision path here).
 function isQuotaBlocked() {
   const openOut = isOpenaiBlocked() || !process.env.OPENAI_API_KEY;
   const gemOut  = isGeminiBlocked() || !process.env.GEMINI_API_KEY;
   return openOut && gemOut;
+}
+
+// Same idea for text-only calls (getCatResponse, replyToUser), which can also
+// be served by Ollama — so those aren't "blocked" just because cloud keys are
+// missing/rate-limited, as long as Ollama is configured. In offline mode, the
+// only available backend is Ollama, so blocked <=> Ollama isn't configured.
+function isTextBlocked(offlineMode) {
+  if (offlineMode) return !isOllamaConfigured();
+  return isQuotaBlocked() && !isOllamaConfigured();
 }
 
 let openaiKeyMissingLogged = false;
@@ -166,10 +177,25 @@ async function _geminiChat({ system, user, imageBase64, jsonMode, maxTokens = 40
 
 /**
  * Provider-agnostic chat. Tries OpenAI first; if it returns empty (key missing,
- * blocked, or actual failure), falls back to Gemini. Named `openaiChat` so the
- * many existing call sites keep working unchanged.
+ * blocked, or actual failure), falls back to Gemini, then to Ollama (text-only
+ * — `imageBase64` calls never reach Ollama). Named `openaiChat` so the many
+ * existing call sites keep working unchanged.
+ *
+ * When `opts.offlineMode` is true, cloud providers are skipped entirely: text
+ * calls go straight to Ollama, and image calls return "" rather than sending
+ * a screenshot off the machine (there is no local vision backend wired up).
  */
 async function openaiChat(opts) {
+  const { imageBase64, offlineMode } = opts;
+
+  if (offlineMode) {
+    if (imageBase64) {
+      console.warn("[brain] offline mode: vision call skipped (no local vision backend configured)");
+      return "";
+    }
+    return chatWithOllama(opts);
+  }
+
   if (process.env.OPENAI_API_KEY && !isOpenaiBlocked()) {
     const text = await _openaiChat(opts);
     if (text) return text;
@@ -178,12 +204,17 @@ async function openaiChat(opts) {
     const text = await _geminiChat(opts);
     if (text) return text;
   }
-  // Last-ditch: if openai is blocked but key exists and gemini is unavailable, retry openai
-  // (user might have a fresh quota even though we marked blocked recently).
+  if (!imageBase64 && isOllamaConfigured()) {
+    const text = await chatWithOllama(opts);
+    if (text) return text;
+  }
   return "";
 }
 
-async function describeScreen(imageBuffer) {
+async function describeScreen(imageBuffer, offlineMode = false) {
+  // No local vision backend is wired up — offline mode skips this entirely
+  // rather than sending a screenshot to the cloud.
+  if (offlineMode) return "no observation";
   if (isQuotaBlocked()) return "no observation";
   if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) return "no observation";
 
@@ -199,8 +230,8 @@ async function describeScreen(imageBuffer) {
   return text || "no observation";
 }
 
-async function getCatResponse(description, memory) {
-  if (isQuotaBlocked()) return { response: "", tag: "" };
+async function getCatResponse(description, memory, offlineMode = false) {
+  if (isTextBlocked(offlineMode)) return { response: "", tag: "" };
   const safe = memory && typeof memory === "object" ? memory : {};
   const obs = Array.isArray(safe.observations) ? safe.observations : [];
   const sessionCount = typeof safe.session_count === "number" ? safe.session_count : 0;
@@ -232,6 +263,7 @@ async function getCatResponse(description, memory) {
     user: JSON.stringify(userContext),
     jsonMode: true,
     maxTokens: 200,
+    offlineMode,
   });
 
   if (!raw) return { response: "", tag: "" };
@@ -270,7 +302,9 @@ You will be given subject, sender, and body. Return STRICT JSON with three keys:
 
 JSON only. No markdown fences. No commentary.`;
 
-async function summarizePdfImage(base64Image) {
+async function summarizePdfImage(base64Image, offlineMode = false) {
+  // No local vision backend is wired up — skip rather than leak a screenshot.
+  if (offlineMode) return "";
   // Never throw — the dispatcher already tries OpenAI then Gemini, and if
   // both are out we return empty so the renderer can show a friendly fallback
   // instead of an Electron IPC stack trace.
@@ -283,14 +317,17 @@ async function summarizePdfImage(base64Image) {
   return text || "";
 }
 
-async function analyzeEmail({ subject, sender, body }) {
-  // Never throw — fail open with empty fields; renderer shows a kind fallback.
+async function analyzeEmail({ subject, sender, body }, offlineMode = false) {
+  // Text-only (subject/sender/body) — no screenshot involved, so this can
+  // run through Ollama in offline mode same as getCatResponse/replyToUser.
+  if (isTextBlocked(offlineMode)) return { summary: "", draftReply: "", clarifyingQuestion: "" };
   const userMsg = `Subject: ${subject}\nFrom: ${sender}\n\n${body}`;
   const raw = await openaiChat({
     system: EMAIL_PROMPT,
     user: userMsg,
     jsonMode: true,
     maxTokens: 400,
+    offlineMode,
   });
   if (!raw) return { summary: "", draftReply: "", clarifyingQuestion: "" };
   try {
@@ -319,13 +356,14 @@ Rules:
 
 Return only the reply. Nothing else.`;
 
-async function replyToUser(userText) {
-  if (isQuotaBlocked()) return "mm. ask again in a bit.";
+async function replyToUser(userText, offlineMode = false) {
+  if (isTextBlocked(offlineMode)) return "mm. ask again in a bit.";
   if (!userText || !userText.trim()) return "";
   const text = await openaiChat({
     system: USER_REPLY_PROMPT,
     user: userText.slice(0, 2000),
     maxTokens: 120,
+    offlineMode,
   });
   return (text || "").replace(/^["']|["']$/g, "");
 }
@@ -343,7 +381,9 @@ Rules:
 
 Return only the question (or empty string). Nothing else.`;
 
-async function askMouseQuestion(imageBuffer) {
+async function askMouseQuestion(imageBuffer, offlineMode = false) {
+  // No local vision backend is wired up — skip rather than leak a screenshot.
+  if (offlineMode) return "";
   if (isQuotaBlocked()) return "";
   if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) return "";
   const text = await openaiChat({
@@ -375,7 +415,9 @@ Rules:
 
 Return only the message text. No quotes. No JSON.`;
 
-async function proactiveAssist(imageBuffer, memory) {
+async function proactiveAssist(imageBuffer, memory, offlineMode = false) {
+  // No local vision backend is wired up — skip rather than leak a screenshot.
+  if (offlineMode) return "";
   if (isQuotaBlocked()) return "";
   if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) return "";
 

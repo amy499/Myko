@@ -16,6 +16,7 @@ const { promisify } = require("util");
 const brain = require("./brain");
 const { CalendarManager, GoogleCalendarProvider, OutlookCalendarProvider } = require("./calendar");
 const { speakWithQwen3, isQwen3Available } = require("./voice");
+const { isOllamaConfigured } = require("./ollama");
 const listenerModule = require("./listener");
 
 const execFileP = promisify(execFile);
@@ -28,6 +29,7 @@ const DEFAULT_SETTINGS = {
   voiceProfile: "soft",
   autoVoiceByContext: true,
   mouseQuestionsEnabled: true,
+  offlineMode: false,
 };
 
 let mainWindow;
@@ -179,7 +181,7 @@ function startMouseDwellWatcher() {
       lastQuestionAt_pos = { x: cursor.x, y: cursor.y };
       if (activeTrigger) lastActiveQuestionAt = now;
       mouseQuestionInFlight = true;
-      askMouseQuestion(cursor)
+      askMouseQuestion(cursor, settings.offlineMode)
         .catch((e) => console.warn("[cat] mouse question failed:", e.message))
         .finally(() => {
           mouseQuestionInFlight = false;
@@ -188,7 +190,10 @@ function startMouseDwellWatcher() {
   }, MOUSE_POLL_MS);
 }
 
-async function askMouseQuestion(cursor) {
+async function askMouseQuestion(cursor, offlineMode) {
+  // No local vision backend is wired up — skip the capture entirely rather
+  // than take a screenshot we're not going to send anywhere.
+  if (offlineMode) return;
   const x = Math.max(0, Math.round(cursor.x - REGION_W / 2));
   const y = Math.max(0, Math.round(cursor.y - REGION_H / 2));
   const tmp = path.join(os.tmpdir(), `cat-region-${Date.now()}.png`);
@@ -202,7 +207,7 @@ async function askMouseQuestion(cursor) {
       tmp,
     ]);
     const buf = await fs.readFile(tmp);
-    const question = await brain.askMouseQuestion(buf);
+    const question = await brain.askMouseQuestion(buf, offlineMode);
     if (question && question.trim() && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("cat:mouseQuestion", question.trim());
     }
@@ -237,7 +242,8 @@ ipcMain.handle("describe-screen", async (_e, imageBuffer) => {
   const buf = Buffer.isBuffer(imageBuffer)
     ? imageBuffer
     : Buffer.from(imageBuffer);
-  return brain.describeScreen(buf);
+  const settings = await readSettings();
+  return brain.describeScreen(buf, settings.offlineMode);
 });
 
 ipcMain.handle("get-cat-response", async (_e, description, memory) => {
@@ -248,7 +254,8 @@ ipcMain.handle("get-cat-response", async (_e, description, memory) => {
       enrichedDescription = `${description}\n\nUpcoming events:\n${calendarContext}`;
     }
   }
-  return brain.getCatResponse(enrichedDescription, memory);
+  const settings = await readSettings();
+  return brain.getCatResponse(enrichedDescription, memory, settings.offlineMode);
 });
 
 ipcMain.handle("read-memory", async () => {
@@ -365,7 +372,8 @@ ipcMain.handle("cat:capturePrimary", async () => {
 
 ipcMain.handle("cat:summarizePdf", async (_e, b64) => {
   try {
-    return await brain.summarizePdfImage(b64);
+    const settings = await readSettings();
+    return await brain.summarizePdfImage(b64, settings.offlineMode);
   } catch (e) {
     console.error("[cat] summarizePdf failed:", e.message);
     throw e;
@@ -374,7 +382,8 @@ ipcMain.handle("cat:summarizePdf", async (_e, b64) => {
 
 ipcMain.handle("cat:analyzeEmail", async (_e, mail) => {
   try {
-    return await brain.analyzeEmail(mail);
+    const settings = await readSettings();
+    return await brain.analyzeEmail(mail, settings.offlineMode);
   } catch (e) {
     console.error("[cat] analyzeEmail failed:", e.message);
     throw e;
@@ -455,9 +464,12 @@ ipcMain.handle("cat:hasVoiceKey", async () =>
   Boolean(process.env.ELEVENLABS_API_KEY)
 );
 
+ipcMain.handle("cat:hasOllama", async () => isOllamaConfigured());
+
 ipcMain.handle("cat:replyToUser", async (_e, userText) => {
   try {
-    return await brain.replyToUser(userText);
+    const settings = await readSettings();
+    return await brain.replyToUser(userText, settings.offlineMode);
   } catch (e) {
     console.error("[cat] replyToUser failed:", e.message);
     return "";
@@ -479,6 +491,11 @@ ipcMain.handle("cat:hasTranscriptionKey", async () =>
 );
 
 ipcMain.handle("cat:proactiveAssist", async () => {
+  const settings = await readSettings();
+  // No local vision backend is wired up — skip the capture entirely rather
+  // than take a screenshot we're not going to send anywhere.
+  if (settings.offlineMode) return "";
+
   const tmp = path.join(os.tmpdir(), `cat-proactive-${Date.now()}.png`);
   try {
     await execFileP("screencapture", ["-x", "-t", "png", tmp]);
@@ -487,7 +504,7 @@ ipcMain.handle("cat:proactiveAssist", async () => {
     try {
       memory = JSON.parse(await fs.readFile(MEMORY_PATH, "utf8"));
     } catch {}
-    return await brain.proactiveAssist(buf, memory);
+    return await brain.proactiveAssist(buf, memory, settings.offlineMode);
   } catch (e) {
     console.error("[cat] proactiveAssist failed:", e.message);
     return "";

@@ -26,6 +26,8 @@ const $voiceToggle = document.getElementById("voice-toggle");
 const $voiceProfile = document.getElementById("voice-profile");
 const $autoVoice = document.getElementById("auto-voice");
 const $voiceStatus = document.getElementById("voice-status");
+const $offlineToggle = document.getElementById("offline-toggle");
+const $offlineStatus = document.getElementById("offline-status");
 
 const SPRITES = {
   puddle: document.getElementById("s-puddle"),
@@ -66,8 +68,10 @@ const state = {
     voiceEnabled: false,
     voiceProfile: "soft",
     autoVoiceByContext: true,
+    offlineMode: false,
   },
   hasVoiceKey: false,
+  hasOllama: false,
   currentAudio: null,
 };
 
@@ -726,6 +730,11 @@ async function loadSettings() {
   } catch {
     state.hasVoiceKey = false;
   }
+  try {
+    state.hasOllama = await cat.hasOllama();
+  } catch {
+    state.hasOllama = false;
+  }
   reflectSettingsToUI();
 }
 
@@ -733,6 +742,7 @@ function reflectSettingsToUI() {
   $voiceToggle.checked = !!state.settings.voiceEnabled;
   $voiceProfile.value = state.settings.voiceProfile || "soft";
   $autoVoice.checked = !!state.settings.autoVoiceByContext;
+  $offlineToggle.checked = !!state.settings.offlineMode;
 
   if (!state.hasVoiceKey) {
     $voiceStatus.textContent = "no ELEVENLABS_API_KEY in .env — voice is disabled";
@@ -744,6 +754,19 @@ function reflectSettingsToUI() {
       : "voice off. text only.";
     $voiceStatus.classList.remove("warn");
     $voiceToggle.disabled = false;
+  }
+
+  if (!state.hasOllama) {
+    $offlineStatus.textContent =
+      "Ollama not configured — set OLLAMA_ENABLED=true in .env and run `ollama serve`";
+    $offlineStatus.classList.add("warn");
+  } else if (state.settings.offlineMode) {
+    $offlineStatus.textContent =
+      "offline mode on — conversation runs on Ollama; screen-watching and PDF/email modes are paused (no local vision model).";
+    $offlineStatus.classList.remove("warn");
+  } else {
+    $offlineStatus.textContent = "offline mode off. using cloud (OpenAI/Gemini).";
+    $offlineStatus.classList.remove("warn");
   }
 }
 
@@ -783,6 +806,12 @@ function applyVoiceProfileLook(profile) {
 $autoVoice.addEventListener("change", async (e) => {
   state.settings.autoVoiceByContext = e.target.checked;
   await cat.setSettings({ autoVoiceByContext: e.target.checked });
+});
+
+$offlineToggle.addEventListener("change", async (e) => {
+  state.settings.offlineMode = e.target.checked;
+  await cat.setSettings({ offlineMode: e.target.checked });
+  reflectSettingsToUI();
 });
 
 /* ---------- random schedulers ---------- */
